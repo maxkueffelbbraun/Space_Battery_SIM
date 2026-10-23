@@ -1,0 +1,64 @@
+*PADS-ECO-V10.0-METRIC*
+
+*REMARK* -- Update tool.pcb -- Thu Aug 29 11:17:11 2024
+
+
+*PART*
+M2 MH3MM5
+M7 MH3MM5
+*END*
+*PADS-ECO-V10.0-METRIC*
+
+*REMARK* -- Update tool.pcb -- Thu Aug 29 11:21:40 2024
+
+
+*DELPART*
+M7 MH3MM5
+M2 MH3MM5
+*END*
+*PADS-ECO-V10.0-METRIC*
+
+*REMARK* -- Update tool.pcb -- Fri Aug 30 10:36:51 2024
+
+*END*
+*PADS-ECO-V10.0-METRIC*
+
+*REMARK* -- Update tool.pcb -- Fri Aug 30 11:31:41 2024
+
+*END*
+*PADS-ECO-V10.0-METRIC*
+
+*REMARK* -- Update tool.pcb -- Fri Aug 30 11:35:55 2024
+
+*END*
+*PADS-ECO-V10.0-METRIC*
+
+*REMARK* -- Update tool.pcb -- Wed Oct  9 10:54:50 2024
+
+
+*PART*
+M3 MH3MM5
+*END*
+*PADS-ECO-V10.0-METRIC*
+
+*REMARK* -- Update tool.pcb -- Wed Oct  9 10:56:58 2024
+
+
+*DELPART*
+M3 MH3MM5
+
+*DELPIN*
+X7.5    GND
+X7.6    GND
+*END*
+*PADS-ECO-V10.0-METRIC*
+
+*REMARK* -- Update tool.pcb -- Wed Oct  9 11:07:47 2024
+
+
+*DELPIN*
+D1.2    GND
+
+*PART*
+M3 MH3MM5
+*END*
