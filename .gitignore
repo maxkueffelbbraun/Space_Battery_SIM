@@ -1,6 +1,7 @@
 .pio/
 .vscode/
 build/
+*.log
 sdkconfig
 sdkconfig.*
 !sdkconfig.defaults

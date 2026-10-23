@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/stream_buffer.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "driver/usb_serial_jtag.h"
@@ -34,7 +35,13 @@
 #define VMEAS_DIVIDER   3.0f         // (R5 20k + R7 10k) / R7
 #define LED_PULSE_MS    50
 
+// Frame: [type][cmd][d0][d1][cs], byte sum == 0 mod 256 (see Dok/.../read_akku.py)
+#define FRAME_LEN       5
+#define FRAME_READ      0x3F    // '?'
+#define FRAME_WRITE     0x21    // '!'
+
 static QueueHandle_t uart_evt_q;
+static StreamBufferHandle_t rx_sb;
 static uart_config_t ucfg = {
     .baud_rate = 9600,
     .data_bits = UART_DATA_8_BITS,
@@ -86,6 +93,7 @@ static void rx_task(void *arg)
                 }
                 left -= r;
                 cnt_bytes += r;
+                xStreamBufferSend(rx_sb, buf, r, 0);
                 if (!quiet) {
                     dump("RX", buf, r);
                 }
@@ -122,6 +130,41 @@ static void bat_send(const uint8_t *d, int n)
     uart_write_bytes(BAT_UART, d, n);
     dump("TX", d, n);
     led_tx_until = esp_timer_get_time() / 1000 + LED_PULSE_MS;
+}
+
+// Returns 0 on valid response, -1 on timeout, -2 if only an echo of the request came back.
+static int bat_request(uint8_t type, uint8_t cmd, uint8_t d0, uint8_t d1, uint8_t resp[FRAME_LEN], int timeout_ms)
+{
+    uint8_t req[FRAME_LEN] = {type, cmd, d0, d1, 0};
+    req[4] = (uint8_t)-(req[0] + req[1] + req[2] + req[3]);
+    uint8_t win[64];
+    int n = 0;
+    bool echo = false;
+
+    xStreamBufferReset(rx_sb);
+    uart_write_bytes(BAT_UART, req, FRAME_LEN);
+    if (!quiet) {
+        dump("TX", req, FRAME_LEN);
+    }
+    led_tx_until = esp_timer_get_time() / 1000 + LED_PULSE_MS;
+
+    int64_t end = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < end && n < sizeof(win)) {
+        n += xStreamBufferReceive(rx_sb, win + n, sizeof(win) - n, pdMS_TO_TICKS(10));
+        for (int i = 0; i + FRAME_LEN <= n; i++) {
+            const uint8_t *f = &win[i];
+            if (f[1] != cmd || (uint8_t)(f[0] + f[1] + f[2] + f[3] + f[4]) != 0) {
+                continue;
+            }
+            if (!memcmp(f, req, FRAME_LEN)) {
+                echo = true;
+                continue;
+            }
+            memcpy(resp, f, FRAME_LEN);
+            return 0;
+        }
+    }
+    return echo ? -2 : -1;
 }
 
 static int vbat_mv(void)
@@ -176,6 +219,7 @@ static void hw_init(void)
     int dip = gpio_get_level(PIN_DIP1) | gpio_get_level(PIN_DIP2) << 1 | gpio_get_level(PIN_DIP3) << 2;
     ucfg.baud_rate = dip_baud[dip];
 
+    rx_sb = xStreamBufferCreate(256, 1);
     uart_driver_install(BAT_UART, 2048, 1024, 32, &uart_evt_q, 0);
     uart_param_config(BAT_UART, &ucfg);
     uart_set_pin(BAT_UART, PIN_BAT_TX, PIN_BAT_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
@@ -197,6 +241,10 @@ static void print_status(void)
 static void print_help(void)
 {
     printf("Commands:\n"
+           "  probe               find baud/parity by sending the version request\n"
+           "  info                read version, capacity, remaining, status, LFC, day counter\n"
+           "  rd <cmd> [d0] [d1]  read request '?' (cmd as char or hex), e.g. rd v / rd 63 A5\n"
+           "  wr <cmd> [d0] [d1]  write request '!' - CHANGES battery state (wr d A5 = discharge)\n"
            "  status              show settings and counters\n"
            "  baud <n>            set battery UART baud rate\n"
            "  parity n|e|o        set parity\n"
@@ -236,6 +284,107 @@ static void cmd_scan(int dwell_ms)
     cnt_errs = 0;
     quiet = false;
     printf("Best candidate: many bytes, zero errors. Restored %d baud.\n", saved);
+}
+
+static const char *rc_text(int rc)
+{
+    return rc == -2 ? "only echo of request received" : "no valid response";
+}
+
+static void cmd_info(void)
+{
+    static const struct {
+        const char *name;
+        uint8_t cmd, d0;
+    } q[] = {
+        {"SW version", 'v', 0x00}, {"Capacity", 'c', 0x00}, {"Remaining", 'r', 0x00},
+        {"Status", 's', 0x00}, {"LFC", 'c', 0xA5}, {"Day counter", 't', 0x00},
+    };
+    static const char flags[] = "nhrdmvigawsuTtHc";
+    uint8_t r[FRAME_LEN];
+
+    quiet = true;
+    for (int i = 0; i < sizeof(q) / sizeof(q[0]); i++) {
+        int rc = bat_request(FRAME_READ, q[i].cmd, q[i].d0, 0, r, 200);
+        if (rc) {
+            printf("%-12s %s\n", q[i].name, rc_text(rc));
+        } else {
+            uint16_t v = r[2] | r[3] << 8;
+            printf("%-12s ", q[i].name);
+            if (q[i].cmd == 'v' || q[i].cmd == 't') {
+                printf("%u", r[2]);
+            } else if (q[i].cmd == 's') {
+                // Bit 15 -> 'n' ... bit 0 -> 'c', as in read_akku.py
+                for (int b = 15; b >= 0; b--) {
+                    putchar((v >> b) & 1 ? flags[15 - b] : '-');
+                }
+            } else {
+                printf("%u", v);
+            }
+            printf("   [%02X %02X %02X %02X %02X]\n", r[0], r[1], r[2], r[3], r[4]);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    quiet = false;
+    printf("%-12s %d mV (board ADC)\n", "Voltage", vbat_mv());
+}
+
+static void cmd_probe(void)
+{
+    static const int bauds[] = {9600, 19200, 4800, 38400, 57600, 115200, 2400, 1200};
+    static const uart_parity_t pars[] = {UART_PARITY_EVEN, UART_PARITY_DISABLE, UART_PARITY_ODD};
+    uint8_t r[FRAME_LEN];
+    bool echo = false;
+
+    quiet = true;
+    for (int p = 0; p < 3; p++) {
+        for (int b = 0; b < sizeof(bauds) / sizeof(bauds[0]); b++) {
+            uart_set_baudrate(BAT_UART, bauds[b]);
+            uart_set_parity(BAT_UART, pars[p]);
+            vTaskDelay(pdMS_TO_TICKS(20));
+            uart_flush_input(BAT_UART);
+            int rc = bat_request(FRAME_READ, 'v', 0, 0, r, 150);
+            echo |= rc == -2;
+            if (rc == 0) {
+                ucfg.baud_rate = bauds[b];
+                ucfg.parity = pars[p];
+                quiet = false;
+                printf("Battery answered: [%02X %02X %02X %02X %02X] -> SW version %u\n",
+                       r[0], r[1], r[2], r[3], r[4], r[2]);
+                print_status();
+                return;
+            }
+        }
+    }
+    uart_set_baudrate(BAT_UART, ucfg.baud_rate);
+    uart_set_parity(BAT_UART, ucfg.parity);
+    quiet = false;
+    printf("No answer.%s Check: route esp, battery powered/awake (pwr/q3/q4), wiring, voltage level, 'inv 1'.\n",
+           echo ? " Echo seen, so TX path works." : "");
+}
+
+static uint8_t parse_cmd_byte(const char *s)
+{
+    return (strlen(s) == 1 && isalpha((int)s[0])) ? (uint8_t)s[0] : (uint8_t)strtoul(s, NULL, 16);
+}
+
+static void cmd_rdwr(uint8_t type, char *args)
+{
+    char *c = strtok(args, " ");
+    char *a = strtok(NULL, " ");
+    char *b = strtok(NULL, " ");
+    if (!c) {
+        return;
+    }
+    uint8_t r[FRAME_LEN];
+    int rc = bat_request(type, parse_cmd_byte(c), a ? (uint8_t)strtoul(a, NULL, 16) : 0,
+                         b ? (uint8_t)strtoul(b, NULL, 16) : 0, r, 300);
+    if (rc) {
+        printf("%s\n", rc_text(rc));
+    } else {
+        printf("OK [%02X %02X %02X %02X %02X] d0=%u d1=%u u16=%u\n", r[0], r[1], r[2], r[3], r[4],
+               r[2], r[3], r[2] | r[3] << 8);
+    }
 }
 
 static void cmd_tx_hex(char *args)
@@ -279,6 +428,14 @@ static void handle_line(char *line)
         print_help();
     } else if (!strcmp(cmd, "status")) {
         print_status();
+    } else if (!strcmp(cmd, "probe")) {
+        cmd_probe();
+    } else if (!strcmp(cmd, "info")) {
+        cmd_info();
+    } else if (!strcmp(cmd, "rd") && arg) {
+        cmd_rdwr(FRAME_READ, arg);
+    } else if (!strcmp(cmd, "wr") && arg) {
+        cmd_rdwr(FRAME_WRITE, arg);
     } else if (!strcmp(cmd, "baud") && arg) {
         int b = atoi(arg);
         if (b >= 300 && b <= 5000000 && uart_set_baudrate(BAT_UART, b) == ESP_OK) {
