@@ -35,7 +35,7 @@
 #define VMEAS_DIVIDER   3.0f         // (R5 20k + R7 10k) / R7
 #define LED_PULSE_MS    50
 
-// Frame: [type][cmd][d0][d1][cs], byte sum == 0 mod 256 (see Dok/.../read_akku.py)
+// Frame: [type][cmd][d0][d1][cs], byte sum == 0 mod 256 (Dok/HAPBBNA-CP-1.40, 19200 8N1)
 #define FRAME_LEN       5
 #define FRAME_READ      0x3F    // '?'
 #define FRAME_WRITE     0x21    // '!'
@@ -43,7 +43,7 @@
 static QueueHandle_t uart_evt_q;
 static StreamBufferHandle_t rx_sb;
 static uart_config_t ucfg = {
-    .baud_rate = 9600,
+    .baud_rate = 19200,
     .data_bits = UART_DATA_8_BITS,
     .parity = UART_PARITY_DISABLE,
     .stop_bits = UART_STOP_BITS_1,
@@ -153,11 +153,12 @@ static int bat_request(uint8_t type, uint8_t cmd, uint8_t d0, uint8_t d1, uint8_
         n += xStreamBufferReceive(rx_sb, win + n, sizeof(win) - n, pdMS_TO_TICKS(10));
         for (int i = 0; i + FRAME_LEN <= n; i++) {
             const uint8_t *f = &win[i];
-            if (f[1] != cmd || (uint8_t)(f[0] + f[1] + f[2] + f[3] + f[4]) != 0) {
+            if (type == FRAME_READ && !memcmp(f, req, FRAME_LEN)) {
+                echo = true;
                 continue;
             }
-            if (!memcmp(f, req, FRAME_LEN)) {
-                echo = true;
+            // Replies always start with '!'; a successful '!r' reply equals the request.
+            if (f[0] != FRAME_WRITE || f[1] != cmd || (uint8_t)(f[0] + f[1] + f[2] + f[3] + f[4]) != 0) {
                 continue;
             }
             memcpy(resp, f, FRAME_LEN);
@@ -215,7 +216,7 @@ static void hw_init(void)
         adc_cali = NULL;
     }
 
-    static const int dip_baud[8] = {9600, 19200, 38400, 57600, 115200, 2400, 4800, 1200};
+    static const int dip_baud[8] = {19200, 9600, 38400, 57600, 115200, 2400, 4800, 1200};
     int dip = gpio_get_level(PIN_DIP1) | gpio_get_level(PIN_DIP2) << 1 | gpio_get_level(PIN_DIP3) << 2;
     ucfg.baud_rate = dip_baud[dip];
 
@@ -242,9 +243,11 @@ static void print_help(void)
 {
     printf("Commands:\n"
            "  probe               find baud/parity by sending the version request\n"
-           "  info                read version, capacity, remaining, status, LFC, day counter\n"
-           "  rd <cmd> [d0] [d1]  read request '?' (cmd as char or hex), e.g. rd v / rd 63 A5\n"
-           "  wr <cmd> [d0] [d1]  write request '!' - CHANGES battery state (wr d A5 = discharge)\n"
+           "  info                read version, capacity, remaining time, day counter, status, serial no.\n"
+           "  rd <cmd> [d0] [d1]  read request '?' (cmd as char or 2-digit hex), e.g. rd v / rd c A5\n"
+           "  wr <cmd> [d0] [d1]  write request '!' - CHANGES battery state:\n"
+           "                        wr d 0|A5 discharge mode (left after 15 s), wr a accutest,\n"
+           "                        wr r <lo> <hi> set remaining time (minutes)\n"
            "  status              show settings and counters\n"
            "  baud <n>            set battery UART baud rate\n"
            "  parity n|e|o        set parity\n"
@@ -291,39 +294,69 @@ static const char *rc_text(int rc)
     return rc == -2 ? "only echo of request received" : "no valid response";
 }
 
+static int info_req(const char *name, uint8_t cmd, uint8_t d0, uint8_t r[FRAME_LEN])
+{
+    vTaskDelay(pdMS_TO_TICKS(50));
+    int rc = bat_request(FRAME_READ, cmd, d0, 0, r, 200);
+    printf("%-12s ", name);
+    if (rc) {
+        printf("%s\n", rc_text(rc));
+    }
+    return rc;
+}
+
 static void cmd_info(void)
 {
-    static const struct {
-        const char *name;
-        uint8_t cmd, d0;
-    } q[] = {
-        {"SW version", 'v', 0x00}, {"Capacity", 'c', 0x00}, {"Remaining", 'r', 0x00},
-        {"Status", 's', 0x00}, {"LFC", 'c', 0xA5}, {"Day counter", 't', 0x00},
+    // Status bits: byte3 MSB..LSB, then byte4 MSB..LSB
+    static const char flag_chr[] = "awsuTtHcnhrdmvig";
+    static const char *const flag_txt[16] = {
+        "Alarm", "Warning", "charging via serial command enabled", "-dU criteria",
+        "dT/dt criteria", "time criteria", "hall sensor active", "charging (don't start accutest)",
+        "NTC defect", "temperature out of range", "Vbat short (<0.6 V)", "Vbat deep (<3.1 V)",
+        "Vbat minimal (<3.8 V)", "Vbat over limit (>6.57 V)", "discharge current too high",
+        "charge current too high",
     };
-    static const char flags[] = "nhrdmvigawsuTtHc";
     uint8_t r[FRAME_LEN];
 
     quiet = true;
-    for (int i = 0; i < sizeof(q) / sizeof(q[0]); i++) {
-        int rc = bat_request(FRAME_READ, q[i].cmd, q[i].d0, 0, r, 200);
-        if (rc) {
-            printf("%-12s %s\n", q[i].name, rc_text(rc));
-        } else {
-            uint16_t v = r[2] | r[3] << 8;
-            printf("%-12s ", q[i].name);
-            if (q[i].cmd == 'v' || q[i].cmd == 't') {
-                printf("%u", r[2]);
-            } else if (q[i].cmd == 's') {
-                // Bit 15 -> 'n' ... bit 0 -> 'c', as in read_akku.py
-                for (int b = 15; b >= 0; b--) {
-                    putchar((v >> b) & 1 ? flags[15 - b] : '-');
-                }
-            } else {
-                printf("%u", v);
+    if (!info_req("Version", 'v', 0, r)) {
+        printf("SW %u.%02u, %s%s, nominal %u mAh\n", r[2] / 100, r[2] % 100,
+               r[3] & 0x80 ? "LiIon" : "NiMH", r[3] & 0x40 ? " (beta)" : "", (r[3] & 0x3F) * 100);
+    }
+    if (!info_req("Capacity", 'c', 0x00, r)) {
+        printf("%u mAh\n", r[2] | r[3] << 8);
+    }
+    if (!info_req("Last full", 'c', 0xA5, r)) {
+        printf("%u mAh\n", r[2] | r[3] << 8);
+    }
+    if (!info_req("Remaining", 'r', 0, r)) {
+        printf("%u min\n", r[2] | r[3] << 8);
+    }
+    if (!info_req("Day counter", 't', 0, r)) {
+        printf("%u\n", r[2]);
+    }
+    if (!info_req("Status", 's', 0, r)) {
+        for (int i = 0; i < 16; i++) {
+            putchar(r[2 + i / 8] & (0x80 >> (i % 8)) ? flag_chr[i] : '-');
+            if (i == 7) {
+                putchar(' ');
             }
-            printf("   [%02X %02X %02X %02X %02X]\n", r[0], r[1], r[2], r[3], r[4]);
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        putchar('\n');
+        for (int i = 0; i < 16; i++) {
+            if (r[2 + i / 8] & (0x80 >> (i % 8))) {
+                printf("             %c = %s\n", flag_chr[i], flag_txt[i]);
+            }
+        }
+    }
+    if (!info_req("Serial no.", '1', 0, r)) {
+        uint32_t sn = r[2] | r[3] << 8;
+        if (bat_request(FRAME_READ, '2', 0, 0, r, 200) == 0) {
+            sn |= (uint32_t)r[2] << 16 | (uint32_t)r[3] << 24;
+            printf("%lu (0x%08lX)\n", (unsigned long)sn, (unsigned long)sn);
+        } else {
+            printf("low word 0x%04lX, high word: no response\n", (unsigned long)sn);
+        }
     }
     quiet = false;
     printf("%-12s %d mV (board ADC)\n", "Voltage", vbat_mv());
@@ -331,8 +364,8 @@ static void cmd_info(void)
 
 static void cmd_probe(void)
 {
-    static const int bauds[] = {9600, 19200, 4800, 38400, 57600, 115200, 2400, 1200};
-    static const uart_parity_t pars[] = {UART_PARITY_EVEN, UART_PARITY_DISABLE, UART_PARITY_ODD};
+    static const int bauds[] = {19200, 9600, 4800, 38400, 57600, 115200, 2400, 1200};
+    static const uart_parity_t pars[] = {UART_PARITY_DISABLE, UART_PARITY_EVEN, UART_PARITY_ODD};
     uint8_t r[FRAME_LEN];
     bool echo = false;
 
@@ -349,8 +382,8 @@ static void cmd_probe(void)
                 ucfg.baud_rate = bauds[b];
                 ucfg.parity = pars[p];
                 quiet = false;
-                printf("Battery answered: [%02X %02X %02X %02X %02X] -> SW version %u\n",
-                       r[0], r[1], r[2], r[3], r[4], r[2]);
+                printf("Battery answered: [%02X %02X %02X %02X %02X] -> SW %u.%02u\n",
+                       r[0], r[1], r[2], r[3], r[4], r[2] / 100, r[2] % 100);
                 print_status();
                 return;
             }
@@ -365,7 +398,8 @@ static void cmd_probe(void)
 
 static uint8_t parse_cmd_byte(const char *s)
 {
-    return (strlen(s) == 1 && isalpha((int)s[0])) ? (uint8_t)s[0] : (uint8_t)strtoul(s, NULL, 16);
+    // Commands are ASCII ('v', '1', '2'); longer tokens are hex bytes.
+    return strlen(s) == 1 ? (uint8_t)s[0] : (uint8_t)strtoul(s, NULL, 16);
 }
 
 static void cmd_rdwr(uint8_t type, char *args)
