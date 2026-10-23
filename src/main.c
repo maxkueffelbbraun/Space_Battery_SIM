@@ -15,6 +15,7 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_timer.h"
+#include "led_strip.h"
 
 // Schematic net names are from the battery's view (TX_ESP = battery TX -> ESP RX).
 #define PIN_BAT_RX      GPIO_NUM_0
@@ -30,10 +31,13 @@
 #define PIN_DIP1        GPIO_NUM_20
 #define PIN_DIP2        GPIO_NUM_21
 #define PIN_DIP3        GPIO_NUM_22
+#define PIN_RGB_LED     GPIO_NUM_8   // onboard WS2812 of the ESP32-C6-Zero
 
 #define BAT_UART        UART_NUM_1
 #define VMEAS_DIVIDER   3.0f         // (R5 20k + R7 10k) / R7
 #define LED_PULSE_MS    50
+#define ERR_SHOW_MS     1000
+#define POLL_PERIOD_MS  2000
 
 // Frame: [type][cmd][d0][d1][cs], byte sum == 0 mod 256 (Dok/HAPBBNA-CP-1.40, 19200 8N1)
 #define FRAME_LEN       5
@@ -55,6 +59,13 @@ static bool line_inverted;
 static volatile bool quiet;
 static volatile uint32_t cnt_bytes, cnt_errs;
 static volatile int64_t led_rx_until, led_tx_until;
+
+typedef enum { LINK_UNKNOWN, LINK_OK, LINK_NO_REPLY, LINK_ECHO } link_state_t;
+static const char *const link_names[] = {"unknown", "OK", "no reply", "echo only"};
+static volatile link_state_t link_state;
+static volatile int64_t err_until;
+static bool poll_enabled = true;
+static led_strip_handle_t rgb;
 
 static adc_oneshot_unit_handle_t adc;
 static adc_channel_t adc_ch;
@@ -104,6 +115,7 @@ static void rx_task(void *arg)
         case UART_FRAME_ERR:
         case UART_PARITY_ERR:
             cnt_errs++;
+            err_until = esp_timer_get_time() / 1000 + ERR_SHOW_MS;
             if (!quiet) {
                 printf("! %s error\n", ev.type == UART_FRAME_ERR ? "frame" : "parity");
             }
@@ -162,9 +174,11 @@ static int bat_request(uint8_t type, uint8_t cmd, uint8_t d0, uint8_t d1, uint8_
                 continue;
             }
             memcpy(resp, f, FRAME_LEN);
+            link_state = LINK_OK;
             return 0;
         }
     }
+    link_state = echo ? LINK_ECHO : LINK_NO_REPLY;
     return echo ? -2 : -1;
 }
 
@@ -196,10 +210,11 @@ static void hw_init(void)
     gpio_config_t oc = {.pin_bit_mask = out_mask, .mode = GPIO_MODE_INPUT_OUTPUT};
     gpio_config(&oc);
 
-    // DIP switches have external 10k pulldowns.
+    // Internal pulldowns keep the default (19200) when the board runs without the PCB's 10k pulldowns.
     gpio_config_t ic = {
         .pin_bit_mask = (1ULL << PIN_DIP1) | (1ULL << PIN_DIP2) | (1ULL << PIN_DIP3),
         .mode = GPIO_MODE_INPUT,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
     };
     gpio_config(&ic);
 
@@ -231,8 +246,8 @@ static void hw_init(void)
 static void print_status(void)
 {
     const char par = ucfg.parity == UART_PARITY_EVEN ? 'E' : ucfg.parity == UART_PARITY_ODD ? 'O' : 'N';
-    printf("UART1 %d 8%c1%s | route=%s | 12V=%d load=%d q3=%d q4=%d | Vbat=%d mV | rx=%lu err=%lu\n",
-           ucfg.baud_rate, par, line_inverted ? " inverted" : "",
+    printf("UART1 %d 8%c1%s | link=%s poll=%d | route=%s | 12V=%d load=%d q3=%d q4=%d | Vbat=%d mV | rx=%lu err=%lu\n",
+           ucfg.baud_rate, par, line_inverted ? " inverted" : "", link_names[link_state], poll_enabled,
            gpio_get_level(PIN_ROUTE) ? "ESP" : "PC",
            gpio_get_level(PIN_PWR_12V), gpio_get_level(PIN_ICONST),
            gpio_get_level(PIN_Q3), gpio_get_level(PIN_Q4), vbat_mv(),
@@ -259,7 +274,10 @@ static void print_help(void)
            "  pwr 0|1             Q1: +12V to battery connector\n"
            "  load 0|1            constant current sink\n"
            "  q3 0|1, q4 0|1      low-side switches\n"
-           "  vbat                measure battery voltage\n");
+           "  vbat                measure battery voltage\n"
+           "  poll 0|1            background '?s' every 2 s to update the RGB LED\n"
+           "RGB LED: blue=unknown green=battery OK red=no reply orange=echo only\n"
+           "         magenta=framing/parity errors, flashes: cyan=TX yellow=RX\n");
 }
 
 static int parse_onoff(const char *s)
@@ -510,6 +528,9 @@ static void handle_line(char *line)
         print_status();
     } else if (!strcmp(cmd, "vbat")) {
         printf("Vbat = %d mV\n", vbat_mv());
+    } else if (!strcmp(cmd, "poll")) {
+        poll_enabled = parse_onoff(arg);
+        print_status();
     } else {
         printf("unknown command, type 'help'\n");
     }
@@ -523,10 +544,47 @@ static void console_init(void)
     setvbuf(stdout, NULL, _IONBF, 0);
 }
 
+static void rgb_init(void)
+{
+    led_strip_config_t sc = {
+        .strip_gpio_num = PIN_RGB_LED,
+        .max_leds = 1,
+        .led_model = LED_MODEL_WS2812,
+        // If red and green appear swapped, use LED_STRIP_COLOR_COMPONENT_FMT_RGB.
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+    };
+    led_strip_rmt_config_t rc = {.resolution_hz = 10 * 1000 * 1000};
+    if (led_strip_new_rmt_device(&sc, &rc, &rgb) != ESP_OK) {
+        rgb = NULL;
+    }
+}
+
+static void rgb_update(int64_t now)
+{
+    static uint32_t shown = UINT32_MAX;
+    uint32_t c;
+    if (now < led_rx_until) {
+        c = 0x302000;
+    } else if (now < led_tx_until) {
+        c = 0x002030;
+    } else if (now < err_until) {
+        c = 0x300030;
+    } else {
+        static const uint32_t link_color[] = {0x000020, 0x003000, 0x300000, 0x300C00};
+        c = link_color[link_state];
+    }
+    if (rgb && c != shown) {
+        led_strip_set_pixel(rgb, 0, c >> 16, (c >> 8) & 0xFF, c & 0xFF);
+        led_strip_refresh(rgb);
+        shown = c;
+    }
+}
+
 void app_main(void)
 {
     hw_init();
     console_init();
+    rgb_init();
     xTaskCreate(rx_task, "bat_rx", 4096, NULL, 10, NULL);
 
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -537,6 +595,7 @@ void app_main(void)
 
     char line[160];
     int len = 0;
+    int64_t next_poll = 0;
     for (;;) {
         uint8_t c;
         if (usb_serial_jtag_read_bytes(&c, 1, pdMS_TO_TICKS(10)) == 1) {
@@ -558,7 +617,15 @@ void app_main(void)
         }
 
         int64_t now = esp_timer_get_time() / 1000;
+        if (poll_enabled && len == 0 && now >= next_poll) {
+            uint8_t r[FRAME_LEN];
+            quiet = true;
+            bat_request(FRAME_READ, 's', 0, 0, r, 150);
+            quiet = false;
+            next_poll = now + POLL_PERIOD_MS;
+        }
         gpio_set_level(PIN_LED1, now < led_rx_until);
         gpio_set_level(PIN_LED2, now < led_tx_until);
+        rgb_update(now);
     }
 }
