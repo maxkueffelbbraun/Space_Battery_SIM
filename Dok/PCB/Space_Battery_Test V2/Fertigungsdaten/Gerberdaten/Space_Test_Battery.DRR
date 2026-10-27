@@ -1,0 +1,18 @@
+----------------------------------------------------------------------------------------------------------------------------------
+NCDrill File Report For: Space_Test_Battery.PcbDoc   20.10.2026  09:29:03
+----------------------------------------------------------------------------------------------------------------------------------
+
+Layer Pair : Top Layer to Bottom Layer
+ASCII RoundHoles File : Space_Test_Battery.TXT
+EIA File   : Space_Test_Battery.DRL
+
+Tool       Hole Size               Hole Tolerance               Hole Type       Hole Count   Plated         Tool Travel
+----------------------------------------------------------------------------------------------------------------------------------
+T1      0.7mm (28mil)                                             Round             87        PTH        740.67mm (29.16inch)
+T2      0.8mm (31mil)                                             Round             7         PTH        65.18mm (2.57inch)
+T3      1.1mm (43mil)                                             Round             66        PTH        379.34mm (14.93inch)
+T4      3.2mm (126mil)                                            Round             4         NPTH       239.00mm (9.41inch)
+----------------------------------------------------------------------------------------------------------------------------------
+Totals                                                                              164
+
+Total Processing Time (hh:mm:ss) : 00:00:00

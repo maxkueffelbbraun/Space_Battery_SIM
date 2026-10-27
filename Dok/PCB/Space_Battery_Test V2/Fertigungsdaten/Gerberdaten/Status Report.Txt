@@ -1,0 +1,13 @@
+Output: NC Drill Files
+Type  : NC Drill
+From  : PCB Document [Space_Test_Battery.PcbDoc]
+   Generated File[Space_Test_Battery.TXT]
+   Generated File[Space_Test_Battery.DRL]
+   Generated File[Space_Test_Battery.LDP]
+   Generated File[Space_Test_Battery.DRR]
+
+
+Files Generated   : 4
+Documents Printed : 0
+
+Finished Output Generation At 09:29:03 On 20.10.2026

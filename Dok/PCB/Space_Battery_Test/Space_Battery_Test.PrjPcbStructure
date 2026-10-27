@@ -1,0 +1,3 @@
+Record=TopLevelDocument|FileName=Current_Sink.SchDoc|SheetNumber=3
+Record=NoMainPathDocument|SourceDocument=Current_Sink.SchDoc|FileName=ESP32.SchDoc|SheetNumber=1
+Record=NoMainPathDocument|SourceDocument=Current_Sink.SchDoc|FileName=UART-USB.SchDoc|SheetNumber=2
