@@ -159,6 +159,7 @@ static int bat_request(uint8_t type, uint8_t cmd, uint8_t d0, uint8_t d1, uint8_
         dump("TX", req, FRAME_LEN);
     }
     led_tx_until = esp_timer_get_time() / 1000 + LED_PULSE_MS;
+    vTaskDelay(pdMS_TO_TICKS(20));
 
     int64_t end = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
     while (esp_timer_get_time() < end && n < sizeof(win)) {
@@ -239,6 +240,7 @@ static void hw_init(void)
     uart_driver_install(BAT_UART, 2048, 1024, 32, &uart_evt_q, 0);
     uart_param_config(BAT_UART, &ucfg);
     uart_set_pin(BAT_UART, PIN_BAT_TX, PIN_BAT_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    gpio_pullup_en(PIN_BAT_RX);
 
     gpio_set_level(PIN_ROUTE, 1);
 }
@@ -312,13 +314,14 @@ static const char *rc_text(int rc)
     return rc == -2 ? "only echo of request received" : "no valid response";
 }
 
-static int info_req(const char *name, uint8_t cmd, uint8_t d0, uint8_t r[FRAME_LEN])
+static int info_req(const char *name, uint8_t cmd, uint8_t d0, uint8_t r[FRAME_LEN], int delay_after_ms)
 {
-    vTaskDelay(pdMS_TO_TICKS(50));
     int rc = bat_request(FRAME_READ, cmd, d0, 0, r, 200);
     printf("%-12s ", name);
     if (rc) {
         printf("%s\n", rc_text(rc));
+    } else if (delay_after_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(delay_after_ms));
     }
     return rc;
 }
@@ -337,23 +340,23 @@ static void cmd_info(void)
     uint8_t r[FRAME_LEN];
 
     quiet = true;
-    if (!info_req("Version", 'v', 0, r)) {
+    if (!info_req("Version", 'v', 0, r, 20)) {
         printf("SW %u.%02u, %s%s, nominal %u mAh\n", r[2] / 100, r[2] % 100,
                r[3] & 0x80 ? "LiIon" : "NiMH", r[3] & 0x40 ? " (beta)" : "", (r[3] & 0x3F) * 100);
     }
-    if (!info_req("Capacity", 'c', 0x00, r)) {
+    if (!info_req("Capacity", 'c', 0x00, r, 300)) {
         printf("%u mAh\n", r[2] | r[3] << 8);
     }
-    if (!info_req("Last full", 'c', 0xA5, r)) {
+    if (!info_req("Last full", 'c', 0xA5, r, 300)) {
         printf("%u mAh\n", r[2] | r[3] << 8);
     }
-    if (!info_req("Remaining", 'r', 0, r)) {
+    if (!info_req("Remaining", 'r', 0, r, 300)) {
         printf("%u min\n", r[2] | r[3] << 8);
     }
-    if (!info_req("Day counter", 't', 0, r)) {
+    if (!info_req("Day counter", 't', 0, r, 300)) {
         printf("%u\n", r[2]);
     }
-    if (!info_req("Status", 's', 0, r)) {
+    if (!info_req("Status", 's', 0, r, 300)) {
         for (int i = 0; i < 16; i++) {
             putchar(r[2 + i / 8] & (0x80 >> (i % 8)) ? flag_chr[i] : '-');
             if (i == 7) {
@@ -367,7 +370,7 @@ static void cmd_info(void)
             }
         }
     }
-    if (!info_req("Serial no.", '1', 0, r)) {
+    if (!info_req("Serial no.", '1', 0, r, 300)) {
         uint32_t sn = r[2] | r[3] << 8;
         if (bat_request(FRAME_READ, '2', 0, 0, r, 200) == 0) {
             sn |= (uint32_t)r[2] << 16 | (uint32_t)r[3] << 24;
