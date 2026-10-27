@@ -553,8 +553,8 @@ static void rgb_init(void)
         .strip_gpio_num = PIN_RGB_LED,
         .max_leds = 1,
         .led_model = LED_MODEL_WS2812,
-        // If red and green appear swapped, use LED_STRIP_COLOR_COMPONENT_FMT_RGB.
-        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+        // This board's LED shows red/green swapped with FMT_GRB.
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_RGB,
     };
     led_strip_rmt_config_t rc = {.resolution_hz = 10 * 1000 * 1000};
     if (led_strip_new_rmt_device(&sc, &rc, &rgb) != ESP_OK) {
